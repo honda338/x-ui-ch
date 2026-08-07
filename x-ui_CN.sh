@@ -4226,8 +4226,65 @@ run_speedtest() {
 
 
 
-    speedtest
+    # 检测 Speedtest 版本：Python speedtest-cli 或 Ookla CLI
+    local speedtest_type="ookla"
+    if speedtest --version 2>&1 | grep -qi "speedtest-cli"; then
+        speedtest_type="python"
+    fi
 
+    echo ""
+    echo -e "${green}Speedtest 模式：${plain}"
+    echo "1) 自动选择最近节点（快速）"
+    echo "2) 指定测速节点"
+    echo ""
+    read -p "请选择 [1-2]：" speed_mode
+    case $speed_mode in
+        1)
+            echo ""
+            echo -e "${green}正在查找最近测速节点...${plain}"
+            # 取第一个服务器 ID 直连测速（跳过全局 ping 扫描）
+            if [[ "$speedtest_type" == "python" ]]; then
+                server_id=$(speedtest --list 2>/dev/null | awk 'NR>1 && $1 ~ /^[0-9]+\)/ {print $1+0; exit}')
+            else
+                server_id=$(speedtest -L 2>/dev/null | awk 'NR>4 && $1 ~ /^[0-9]+$/ {print $1; exit}')
+            fi
+            if [[ -z "$server_id" ]]; then
+                echo -e "${red}未能获取测速节点，请改用模式 2 手动指定。${plain}"
+                return 1
+            fi
+            echo -e "${green}使用服务器 ID: $server_id${plain}"
+            if [[ "$speedtest_type" == "python" ]]; then
+                speedtest --server "$server_id"
+            else
+                speedtest --server-id="$server_id"
+            fi
+            ;;
+        2)
+            echo ""
+            echo -e "${green}正在获取测速节点列表...${plain}"
+            if [[ "$speedtest_type" == "python" ]]; then
+                speedtest --list 2>/dev/null | head -20
+            else
+                speedtest -L 2>/dev/null | head -20
+            fi
+            echo ""
+            read -p "请输入服务器 ID（输入 q 取消）：" server_id
+            if [[ "$server_id" != "q" && -n "$server_id" ]]; then
+                echo ""
+                echo -e "${green}正在测速...${plain}"
+                if [[ "$speedtest_type" == "python" ]]; then
+                    speedtest --server "$server_id"
+                else
+                    speedtest --server-id="$server_id"
+                fi
+            else
+                echo "已取消。"
+            fi
+            ;;
+        *)
+            echo "无效选择，已取消。"
+            ;;
+    esac
 }
 
 
