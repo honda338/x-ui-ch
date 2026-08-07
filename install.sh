@@ -7,7 +7,7 @@ echo -e "${green}>>> 正在安装官方 3x-ui...${plain}"
 bash <(curl -Ls https://raw.githubusercontent.com/MHSanaei/3x-ui/master/install.sh)
 
 echo -e "${green}>>> 正在安装中文管理界面...${plain}"
-curl -Ls https://raw.githubusercontent.com/LJR338/x-ui-ch/main/x-ui_CN.sh -o /usr/bin/x-ui
+curl -Ls https://raw.githubusercontent.com/honda338/x-ui-ch/main/x-ui_CN.sh -o /usr/bin/x-ui
 chmod +x /usr/bin/x-ui
 
 echo ""
