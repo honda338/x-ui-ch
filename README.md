@@ -5,7 +5,7 @@
 ## 一键安装
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/LJR338/x-ui-ch/main/install.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/honda338/x-ui-ch/main/install.sh)
 ```
 
 ## 做了什么
