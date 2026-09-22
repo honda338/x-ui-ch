@@ -1871,6 +1871,8 @@ show_status() {
 
     show_mtproto_status
 
+    show_cert_expiry_line
+
 }
 
 
@@ -6742,6 +6744,382 @@ migrate_db_prompt() {
 
 
 
+# ==================== 数据库备份/恢复 ====================
+
+# 备份目录与保留份数（可用 XUI_BACKUP_DIR 覆盖，便于测试）
+DB_BACKUP_DIR="${XUI_BACKUP_DIR:-/root/xui_backups}"
+DB_BACKUP_KEEP=10
+
+# 解析 SQLite 数据库路径：XUI_DB_PATH 环境变量 > 服务 env 文件的 XUI_DB_FOLDER > 默认
+get_db_path() {
+    if [[ -n "${XUI_DB_PATH}" ]]; then
+        echo "${XUI_DB_PATH}"
+        return
+    fi
+    local folder="/etc/x-ui" envf f
+    envf="$(xui_env_file_path)"
+    if [[ -r "${envf}" ]]; then
+        f="$(grep -E '^XUI_DB_FOLDER=' "${envf}" | head -1 | cut -d= -f2-)"
+        [[ -n "${f}" ]] && folder="${f}"
+    fi
+    echo "${folder}/x-ui.db"
+}
+
+# 面板是否运行在 PostgreSQL 模式
+is_postgres_mode() {
+    local envf
+    envf="$(xui_env_file_path)"
+    [[ -r "${envf}" ]] && grep -q '^XUI_DB_TYPE=postgres' "${envf}"
+}
+
+# 字节 → 人类可读
+fmt_bytes() {
+    awk -v b="$1" 'BEGIN {
+        split("B KB MB GB TB PB", u, " ")
+        i = 1
+        while (b >= 1024 && i < 6) { b /= 1024; i++ }
+        if (i == 1) printf "%d %s", b, u[i]
+        else printf "%.2f %s", b, u[i]
+    }'
+}
+
+# 只读 SQL 查询，输出 TSV 行。sqlite3 优先，缺失时回退 python3。
+xui_sql_tsv() {
+    local db="$1" sql="$2"
+    if command -v sqlite3 > /dev/null 2>&1; then
+        sqlite3 -separator $'\t' "${db}" "${sql}"
+    elif command -v python3 > /dev/null 2>&1; then
+        python3 -c '
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+for row in con.execute(sys.argv[2]):
+    print("\t".join("" if v is None else str(v) for v in row))
+' "${db}" "${sql}"
+    else
+        return 127
+    fi
+}
+
+# 立即备份：sqlite3 热备份优先（带完整性校验），无 sqlite3 时用官方 migrate-db 导出
+db_backup_now() {
+    local db ts out old
+    db="$(get_db_path)"
+    if is_postgres_mode; then
+        LOGE "PostgreSQL 模式不适用文件备份。"
+        LOGI "请使用面板内的数据库备份，或主菜单 24（PostgreSQL 管理）。"
+        return 1
+    fi
+    if [[ ! -f "${db}" ]]; then
+        LOGE "数据库不存在：${db}"
+        return 1
+    fi
+    mkdir -p "${DB_BACKUP_DIR}" || return 1
+    ts="$(date +%Y%m%d_%H%M%S)"
+
+    if command -v sqlite3 > /dev/null 2>&1; then
+        out="${DB_BACKUP_DIR}/x-ui_${ts}.db"
+        if ! sqlite3 "${db}" ".backup '${out}'" 2> /dev/null; then
+            LOGE "热备份失败。"
+            rm -f "${out}"
+            return 1
+        fi
+        if [[ "$(sqlite3 "${out}" 'PRAGMA quick_check;' 2> /dev/null)" != "ok" ]]; then
+            LOGE "备份完整性校验失败，已删除残文件。"
+            rm -f "${out}"
+            return 1
+        fi
+    elif [[ -x "${xui_folder}/x-ui" ]] && "${xui_folder}/x-ui" migrate-db -h 2>&1 | grep -q -- '-dump'; then
+        out="${DB_BACKUP_DIR}/x-ui_${ts}.dump"
+        if ! "${xui_folder}/x-ui" migrate-db "${db}" "${out}"; then
+            LOGE "migrate-db 导出失败。"
+            rm -f "${out}"
+            return 1
+        fi
+    else
+        LOGE "缺少 sqlite3，且 x-ui 不支持 migrate-db 导出。"
+        LOGI "建议安装 sqlite3：apt-get install -y sqlite3 或 dnf install -y sqlite"
+        return 1
+    fi
+
+    # 只保留最近 N 份
+    while IFS= read -r old; do
+        rm -f "${old}"
+    done < <(ls -t "${DB_BACKUP_DIR}"/x-ui_*.db "${DB_BACKUP_DIR}"/x-ui_*.dump 2> /dev/null | tail -n "+$((DB_BACKUP_KEEP + 1))")
+
+    LOGI "备份完成：${out}（$(du -h "${out}" | cut -f1)），已保留最近 ${DB_BACKUP_KEEP} 份"
+}
+
+# 列出已有备份（新→旧）
+db_list_backups() {
+    local f i=0 found=0
+    if [[ ! -d "${DB_BACKUP_DIR}" ]]; then
+        echo -e "${yellow}还没有备份过（${DB_BACKUP_DIR} 不存在）。${plain}"
+        return 0
+    fi
+    echo -e "${green}备份目录：${DB_BACKUP_DIR}${plain}"
+    while IFS= read -r f; do
+        found=1
+        i=$((i + 1))
+        printf "\t%2d) %-45s %s\n" "${i}" "$(basename "${f}")" "$(du -h "${f}" | cut -f1)"
+    done < <(ls -t "${DB_BACKUP_DIR}"/x-ui_* 2> /dev/null)
+    [[ ${found} -eq 0 ]] && echo -e "${yellow}暂无备份文件。${plain}"
+    return 0
+}
+
+# 从备份恢复：先停面板、快照当前库，再还原并重启
+db_restore_backup() {
+    local db files=() f i=0 choice pre ok
+    db="$(get_db_path)"
+    if is_postgres_mode; then
+        LOGE "PostgreSQL 模式请使用面板内备份恢复，或主菜单 24。"
+        return 1
+    fi
+    while IFS= read -r f; do
+        files+=("${f}")
+    done < <(ls -t "${DB_BACKUP_DIR}"/x-ui_* 2> /dev/null)
+    if [[ ${#files[@]} -eq 0 ]]; then
+        LOGE "没有可用备份（${DB_BACKUP_DIR}）。"
+        return 1
+    fi
+
+    echo -e "${yellow}可恢复的备份（新→旧）：${plain}"
+    for f in "${files[@]}"; do
+        i=$((i + 1))
+        printf "\t%2d) %-45s %s\n" "${i}" "$(basename "${f}")" "$(du -h "${f}" 2> /dev/null | cut -f1)"
+    done
+    read -rp "选择要恢复的编号 [1-${#files[@]}]（0 取消）：" choice
+    [[ -z "${choice}" || "${choice}" == "0" ]] && {
+        echo "已取消。"
+        return 0
+    }
+    if ! [[ "${choice}" =~ ^[0-9]+$ ]] || ((choice < 1 || choice > ${#files[@]})); then
+        LOGE "无效编号。"
+        return 1
+    fi
+    f="${files[$((choice - 1))]}"
+    echo -e "${red}警告：恢复会覆盖当前数据库（${db}），面板将重启！${plain}"
+    confirm "确认从 $(basename "${f}") 恢复？" "n" || {
+        echo "已取消。"
+        return 0
+    }
+
+    stop 0
+
+    # 先快照当前库，恢复失败可回退
+    pre="${DB_BACKUP_DIR}/pre_restore_$(date +%Y%m%d_%H%M%S).db"
+    if command -v sqlite3 > /dev/null 2>&1 && [[ "$(sqlite3 "${db}" 'PRAGMA quick_check;' 2> /dev/null)" == "ok" ]]; then
+        sqlite3 "${db}" ".backup '${pre}'" 2> /dev/null
+    elif [[ -f "${db}" ]]; then
+        cp -f "${db}" "${pre}" 2> /dev/null
+    fi
+    [[ -f "${pre}" ]] && LOGI "当前库已快照：${pre}"
+
+    ok=1
+    case "${f}" in
+        *.dump)
+            if migrate_db "${f}" "${db}"; then
+                ok=0
+            fi
+            ;;
+        *)
+            if command -v sqlite3 > /dev/null 2>&1; then
+                if [[ "$(sqlite3 "${f}" 'PRAGMA quick_check;' 2> /dev/null)" != "ok" ]]; then
+                    LOGE "备份文件完整性校验失败，中止恢复。"
+                    start 0
+                    return 1
+                fi
+            fi
+            if cp -f "${f}" "${db}"; then
+                ok=0
+            fi
+            ;;
+    esac
+
+    start 0
+    if [[ ${ok} -eq 0 ]]; then
+        LOGI "恢复完成，面板已重启。"
+    else
+        LOGE "恢复失败！当前库快照在 ${pre}，如面板异常可用它回退。"
+        return 1
+    fi
+}
+
+# 备份/恢复子菜单
+db_backup_menu() {
+    echo -e "${green}\t1.${plain} 立即备份（自动保留最近 ${DB_BACKUP_KEEP} 份）"
+    echo -e "${green}\t2.${plain} 列出备份"
+    echo -e "${green}\t3.${plain} ${red}从备份恢复（覆盖当前数据库）${plain}"
+    echo -e "${green}\t0.${plain} 返回主菜单"
+    read -rp "请选择：" choice
+    case "${choice}" in
+        1)
+            db_backup_now
+            db_backup_menu
+            ;;
+        2)
+            db_list_backups
+            db_backup_menu
+            ;;
+        3)
+            db_restore_backup
+            db_backup_menu
+            ;;
+        0)
+            show_menu
+            ;;
+        *)
+            echo -e "${red}无效选项，请输入有效数字。${plain}\n"
+            db_backup_menu
+            ;;
+    esac
+}
+
+# ==================== 证书到期检查 ====================
+
+# 在菜单状态区显示剩余天数最少的一张证书；未安装面板/无 openssl 时静默跳过
+show_cert_expiry_line() {
+    [[ -x "${xui_folder}/x-ui" ]] || return 0
+    command -v openssl > /dev/null 2>&1 || return 0
+
+    local certs=() c panel_cert seen="" best_name="" best_days=999999
+    local end end_epoch now days label
+    now="$(date +%s)"
+
+    panel_cert="$(${xui_folder}/x-ui setting -getCert true 2> /dev/null | grep 'cert:' | awk -F': ' '{print $2}' | tr -d '[:space:]')"
+    [[ -n "${panel_cert}" && -f "${panel_cert}" ]] && certs+=("${panel_cert}")
+    for c in /root/cert/*/fullchain.pem; do
+        [[ -f "${c}" ]] && certs+=("${c}")
+    done
+    [[ ${#certs[@]} -eq 0 ]] && return 0
+
+    for c in "${certs[@]}"; do
+        case "${seen}" in
+            *"|${c}|"*) continue ;;
+        esac
+        seen="${seen}|${c}|"
+        end="$(openssl x509 -in "${c}" -noout -enddate 2> /dev/null | cut -d= -f2-)"
+        [[ -z "${end}" ]] && continue
+        end_epoch="$(date -d "${end}" +%s 2> /dev/null)"
+        if [[ -n "${end_epoch}" ]]; then
+            days=$(((end_epoch - now) / 86400))
+        elif openssl x509 -in "${c}" -noout -checkend 2592000 > /dev/null 2>&1; then
+            days=999
+        else
+            days=-1
+        fi
+        if ((days < best_days)); then
+            best_days=${days}
+            best_name="${c}"
+        fi
+    done
+    [[ -z "${best_name}" ]] && return 0
+
+    label="$(basename "$(dirname "${best_name}")")"
+    if ((best_days < 0)); then
+        echo -e "证书状态：${red}${label} 已过期 $((-best_days)) 天！${plain}"
+    elif ((best_days < 3)); then
+        echo -e "证书状态：${red}${label} 剩余 ${best_days} 天（即将过期）${plain}"
+    elif ((best_days < 14)); then
+        echo -e "证书状态：${yellow}${label} 剩余 ${best_days} 天${plain}"
+    else
+        echo -e "证书状态：${green}${label} 剩余 ${best_days} 天${plain}（共查 ${#certs[@]} 张）"
+    fi
+}
+
+# ==================== 流量统计 ====================
+
+# 入站累计流量排行 + 客户端 Top10（数据来自面板数据库的累计值）
+traffic_stats() {
+    local db tsv port proto remark enable up down total t_up=0 t_down=0 n=0
+    db="$(get_db_path)"
+    if is_postgres_mode; then
+        LOGE "PostgreSQL 模式暂不支持命令行流量统计，请在面板 Web 界面查看。"
+        before_show_menu
+        return 0
+    fi
+    if [[ ! -f "${db}" ]]; then
+        LOGE "数据库不存在：${db}"
+        before_show_menu
+        return 1
+    fi
+    if ! command -v sqlite3 > /dev/null 2>&1 && ! command -v python3 > /dev/null 2>&1; then
+        LOGE "需要 sqlite3 或 python3 之一来查询数据库。"
+        LOGI "建议安装：apt-get install -y sqlite3"
+        before_show_menu
+        return 1
+    fi
+
+    tsv="$(xui_sql_tsv "${db}" "SELECT port, protocol, remark, enable, up, down, total FROM inbounds ORDER BY (up + down) DESC;" 2> /dev/null)" || tsv=""
+    tsv="${tsv//$'\r'/}"
+
+    echo -e "\n${green}===== 入站流量累计（按 上行+下行 排序）=====${plain}"
+    if [[ -z "${tsv}" ]]; then
+        echo -e "${yellow}（没有入站记录）${plain}"
+    else
+        printf "  %-7s %-11s %-4s %12s %12s %13s %13s  %s\n" "端口" "协议" "状态" "上行" "下行" "合计" "限额剩余" "备注"
+        while IFS=$'\t' read -r port proto remark enable up down total; do
+            [[ -z "${port}" ]] && continue
+            up=${up:-0}
+            down=${down:-0}
+            total=${total:-0}
+            t_up=$((t_up + up))
+            t_down=$((t_down + down))
+            n=$((n + 1))
+            local state left limit
+            if [[ "${enable}" == "1" || "${enable}" == "true" ]]; then
+                state="开"
+            else
+                state="关"
+            fi
+            if ((total > 0)); then
+                left=$((total - up - down))
+                ((left < 0)) && left=0
+                limit="$(fmt_bytes "${left}")"
+            else
+                limit="不限"
+            fi
+            printf "  %-7s %-11s %-4s %12s %12s %13s %13s  %s\n" \
+                "${port}" "${proto}" "${state}" \
+                "$(fmt_bytes "${up}")" "$(fmt_bytes "${down}")" \
+                "$(fmt_bytes $((up + down)))" "${limit}" "${remark}"
+        done <<< "${tsv}"
+        echo -e "  ── 共 ${n} 个入站：累计上行 $(fmt_bytes "${t_up}") / 下行 $(fmt_bytes "${t_down}") / 合计 $(fmt_bytes $((t_up + t_down)))"
+    fi
+
+    tsv="$(xui_sql_tsv "${db}" "SELECT email, up, down, total FROM client_traffics ORDER BY (up + down) DESC LIMIT 10;" 2> /dev/null)" || tsv=""
+    tsv="${tsv//$'\r'/}"
+    echo -e "\n${green}===== 客户端流量 Top10 =====${plain}"
+    if [[ -z "${tsv}" ]]; then
+        echo -e "${yellow}（无客户端记录，或此版本面板没有 client_traffics 表）${plain}"
+    else
+        printf "  %-4s %-24s %12s %12s %13s %13s\n" "排名" "标识(email)" "上行" "下行" "合计" "限额剩余"
+        local rank=0 email c_up c_down c_total c_left c_limit
+        while IFS=$'\t' read -r email c_up c_down c_total; do
+            [[ -z "${email}" ]] && continue
+            rank=$((rank + 1))
+            c_up=${c_up:-0}
+            c_down=${c_down:-0}
+            c_total=${c_total:-0}
+            if ((c_total > 0)); then
+                c_left=$((c_total - c_up - c_down))
+                ((c_left < 0)) && c_left=0
+                c_limit="$(fmt_bytes "${c_left}")"
+            else
+                c_limit="不限"
+            fi
+            printf "  %-4s %-24s %12s %12s %13s %13s\n" \
+                "${rank}" "${email}" \
+                "$(fmt_bytes "${c_up}")" "$(fmt_bytes "${c_down}")" \
+                "$(fmt_bytes $((c_up + c_down)))" "${c_limit}"
+        done <<< "${tsv}"
+    fi
+
+    echo -e "\n${yellow}提示：以上为面板累计值；周期性流量重置以面板设置为准。${plain}"
+    before_show_menu
+}
+
+
+
 show_usage() {
 
     echo -e "┌────────────────────────────────────────────────────────────────┐
@@ -6833,12 +7211,14 @@ show_menu() {
 │  ${green}25.${plain} BBR 加速管理                              │
 │  ${green}26.${plain} 更新地理文件                              │
 │  ${green}27.${plain} Ookla 测速                                │
+│  ${green}28.${plain} 数据库备份/恢复                           │
+│  ${green}29.${plain} 流量统计                                  │
 ╚────────────────────────────────────────────────╝
 "
 
     show_status
 
-    echo && read -rp "请输入您的选择 [0-27]：" num
+    echo && read -rp "请输入您的选择 [0-29]：" num
 
 
 
@@ -7012,9 +7392,21 @@ show_menu() {
 
             ;;
 
+        28)
+
+            check_install && db_backup_menu
+
+            ;;
+
+        29)
+
+            check_install && traffic_stats
+
+            ;;
+
         *)
 
-            LOGE "请输入正确的数字 [0-27]"
+            LOGE "请输入正确的数字 [0-29]"
 
             ;;
 
