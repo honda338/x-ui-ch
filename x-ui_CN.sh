@@ -7084,6 +7084,73 @@ show_cert_expiry_line() {
 # ==================== 流量统计 ====================
 
 # 入站累计流量排行 + 客户端 Top10（数据来自面板数据库的累计值）
+# ---------- 流量表渲染：一次 awk 按终端显示宽度对齐（中文/全角占2列；LC_ALL=C 按字节解析 UTF-8） ----------
+xui_render_in() {
+    printf '%s' "$1" | LC_ALL=C awk '
+    BEGIN {
+        for (i = 1; i < 256; i++) ORD[sprintf("%c", i)] = i
+        SEP = sprintf("%c", 31)
+        print "  " pad("端口", 6) " " pad("协议", 7) " " pad("状态", 4) " " pad("上行", 11) " " pad("下行", 11) " " pad("合计", 11) " " pad("限额剩余", 9) "  备注"
+    }
+    {
+        nf = split($0, F, SEP)
+        if (nf < 7) next
+        print "  " pad(F[1], 6) " " pad(F[2], 7) " " pad(F[3], 4) " " pad(F[4], 11) " " pad(F[5], 11) " " pad(F[6], 11) " " pad(F[7], 9) "  " F[8]
+    }
+    function pad(s, w,   c, k) {
+        c = dw(s); k = w - c; if (k < 0) k = 0
+        return sprintf("%*s", k, "") s
+    }
+    function dw(s,   n, i, w, o) {
+        n = length(s); w = 0; i = 1
+        while (i <= n) {
+            o = ORD[substr(s, i, 1)] + 0
+            if (o < 128) { w++; i++ }
+            else if (o < 192) { i++ }
+            else if (o < 224) { w++; i += 2 }
+            else if (o < 240) { w += 2; i += 3 }
+            else { w += 2; i += 4 }
+        }
+        return w
+    }
+    '
+}
+
+xui_render_c() {
+    printf '%s' "$1" | LC_ALL=C awk '
+    BEGIN {
+        for (i = 1; i < 256; i++) ORD[sprintf("%c", i)] = i
+        SEP = sprintf("%c", 31)
+        print "  " pad("排名", 4) " " padl("标识(email)", 20) " " pad("上行", 11) " " pad("下行", 11) " " pad("合计", 11) " " pad("限额剩余", 9)
+    }
+    {
+        nf = split($0, F, SEP)
+        if (nf < 6) next
+        print "  " pad(F[1], 4) " " padl(F[2], 20) " " pad(F[3], 11) " " pad(F[4], 11) " " pad(F[5], 11) " " pad(F[6], 9)
+    }
+    function pad(s, w,   c, k) {
+        c = dw(s); k = w - c; if (k < 0) k = 0
+        return sprintf("%*s", k, "") s
+    }
+    function padl(s, w,   c, k) {
+        c = dw(s); k = w - c; if (k < 0) k = 0
+        return s sprintf("%*s", k, "")
+    }
+    function dw(s,   n, i, w, o) {
+        n = length(s); w = 0; i = 1
+        while (i <= n) {
+            o = ORD[substr(s, i, 1)] + 0
+            if (o < 128) { w++; i++ }
+            else if (o < 192) { i++ }
+            else if (o < 224) { w++; i += 2 }
+            else if (o < 240) { w += 2; i += 3 }
+            else { w += 2; i += 4 }
+        }
+        return w
+    }
+    '
+}
+
 traffic_stats() {
     local db tsv port proto remark enable up down total t_up=0 t_down=0 n=0
     db="$(get_db_path)"
@@ -7117,7 +7184,7 @@ traffic_stats() {
     if [[ -z "${tsv}" ]]; then
         echo -e "${yellow}（没有入站记录）${plain}"
     else
-        printf "  %-7s %-11s %-4s %12s %12s %13s %13s  %s\n" "端口" "协议" "状态" "上行" "下行" "合计" "限额剩余" "备注"
+        rows=""
         while IFS=$'\t' read -r port proto remark enable up down total; do
             [[ -z "${port}" ]] && continue
             up=${up:-0}
@@ -7139,11 +7206,9 @@ traffic_stats() {
             else
                 limit="不限"
             fi
-            printf "  %-7s %-11s %-4s %12s %12s %13s %13s  %s\n" \
-                "${port}" "${proto}" "${state}" \
-                "$(fmt_bytes "${up}")" "$(fmt_bytes "${down}")" \
-                "$(fmt_bytes $((up + down)))" "${limit}" "${remark}"
+            rows+="${port}"$'\x1f'"${proto}"$'\x1f'"${state}"$'\x1f'"$(fmt_bytes "${up}")"$'\x1f'"$(fmt_bytes "${down}")"$'\x1f'"$(fmt_bytes $((up + down)))"$'\x1f'"${limit}"$'\x1f'"${remark}"$'\n'
         done <<< "${tsv}"
+        xui_render_in "${rows}"
         echo -e "  ── 共 ${n} 个入站：累计上行 $(fmt_bytes "${t_up}") / 下行 $(fmt_bytes "${t_down}") / 合计 $(fmt_bytes $((t_up + t_down)))"
     fi
 
@@ -7157,7 +7222,7 @@ traffic_stats() {
     if [[ -z "${tsv}" ]]; then
         echo -e "${yellow}（无客户端记录，或此版本面板没有 client_traffics 表）${plain}"
     else
-        printf "  %-4s %-24s %12s %12s %13s %13s\n" "排名" "标识(email)" "上行" "下行" "合计" "限额剩余"
+        rows=""
         local rank=0 email c_up c_down c_total c_left c_limit
         while IFS=$'\t' read -r email c_up c_down c_total; do
             [[ -z "${email}" ]] && continue
@@ -7172,11 +7237,9 @@ traffic_stats() {
             else
                 c_limit="不限"
             fi
-            printf "  %-4s %-24s %12s %12s %13s %13s\n" \
-                "${rank}" "${email}" \
-                "$(fmt_bytes "${c_up}")" "$(fmt_bytes "${c_down}")" \
-                "$(fmt_bytes $((c_up + c_down)))" "${c_limit}"
+            rows+="${rank}"$'\x1f'"${email}"$'\x1f'"$(fmt_bytes "${c_up}")"$'\x1f'"$(fmt_bytes "${c_down}")"$'\x1f'"$(fmt_bytes $((c_up + c_down)))"$'\x1f'"${c_limit}"$'\n'
         done <<< "${tsv}"
+        xui_render_c "${rows}"
     fi
 
     echo -e "\n${yellow}提示：以上为面板累计值；周期性流量重置以面板设置为准。${plain}"
