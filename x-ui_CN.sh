@@ -6787,7 +6787,7 @@ fmt_bytes() {
 xui_sql_tsv() {
     local db="$1" sql="$2"
     if command -v sqlite3 > /dev/null 2>&1; then
-        sqlite3 -separator $'\t' "${db}" "${sql}"
+        sqlite3 -separator $'\t' "${db}" "${sql}" 2>&1
     elif command -v python3 > /dev/null 2>&1; then
         python3 -c '
 import sqlite3, sys
@@ -6800,9 +6800,39 @@ for row in con.execute(sys.argv[2]):
     fi
 }
 
+# 校验一个 sqlite 文件是否完好。stdout=原因说明；0=通过（可能降级），1=确有损坏
+xui_db_check() {
+    local f="$1" qc
+    if [[ ! -s "${f}" ]]; then
+        echo "文件为空或不存在"
+        return 1
+    fi
+    if [[ "$(head -c 15 "${f}" 2> /dev/null)" != "SQLite format 3" ]]; then
+        echo "文件头不是 SQLite 格式"
+        return 1
+    fi
+    qc="$(sqlite3 "${f}" 'PRAGMA quick_check;' 2>&1)"
+    qc="${qc//$'\r'/}"
+    qc="$(printf '%s' "${qc}" | head -1)"
+    case "${qc}" in
+        ok)
+            return 0
+            ;;
+        *"malformed database schema"*)
+            # 本机 sqlite 过旧解析不了面板新版 schema（如表达式索引需 sqlite>=3.9）：文件没坏
+            echo "本机 sqlite 过旧无法深度校验（面板库用了新版语法），文件头校验已通过"
+            return 0
+            ;;
+        *)
+            echo "${qc:-quick_check 无输出（sqlite 无法打开文件）}"
+            return 1
+            ;;
+    esac
+}
+
 # 立即备份：sqlite3 热备份优先（带完整性校验），无 sqlite3 时用官方 migrate-db 导出
 db_backup_now() {
-    local db ts out old
+    local db ts out old berr note rc
     db="$(get_db_path)"
     if is_postgres_mode; then
         LOGE "PostgreSQL 模式不适用文件备份。"
@@ -6814,20 +6844,33 @@ db_backup_now() {
         return 1
     fi
     mkdir -p "${DB_BACKUP_DIR}" || return 1
+    # 清理历史孤儿 sidecar（-shm 可再生；空 -wal 无数据）
+    find "${DB_BACKUP_DIR}" -maxdepth 1 -name '*.db-shm' -delete 2> /dev/null
+    find "${DB_BACKUP_DIR}" -maxdepth 1 -name '*.db-wal' -size 0 -delete 2> /dev/null
     ts="$(date +%Y%m%d_%H%M%S)"
 
     if command -v sqlite3 > /dev/null 2>&1; then
         out="${DB_BACKUP_DIR}/x-ui_${ts}.db"
-        if ! sqlite3 "${db}" ".backup '${out}'" 2> /dev/null; then
-            LOGE "热备份失败。"
-            rm -f "${out}"
+        if ! berr="$(sqlite3 "${db}" ".backup '${out}'" 2>&1)"; then
+            LOGE "热备份失败：${berr}"
+            rm -f "${out}" "${out}-shm" "${out}-wal"
             return 1
         fi
-        if [[ "$(sqlite3 "${out}" 'PRAGMA quick_check;' 2> /dev/null)" != "ok" ]]; then
-            LOGE "备份完整性校验失败，已删除残文件。"
-            rm -f "${out}"
+        note="$(xui_db_check "${out}")"
+        rc=$?
+        # 清掉校验打开文件时产生的 sidecar（空 -wal 无数据）
+        if [[ -f "${out}-wal" && -s "${out}-wal" ]]; then
+            LOGW "备份带有非空 -wal，恢复时会一并处理。"
+        else
+            rm -f "${out}-wal" "${out}-shm"
+        fi
+        if [[ ${rc} -ne 0 ]]; then
+            mv -f "${out}" "${out}.failed"
+            LOGE "备份完整性校验失败：${note}"
+            LOGE "文件保留为 ${out}.failed 供排查（不再自动删除）。"
             return 1
         fi
+        [[ -n "${note}" ]] && LOGW "${note}"
     elif [[ -x "${xui_folder}/x-ui" ]] && "${xui_folder}/x-ui" migrate-db -h 2>&1 | grep -q -- '-dump'; then
         out="${DB_BACKUP_DIR}/x-ui_${ts}.dump"
         if ! "${xui_folder}/x-ui" migrate-db "${db}" "${out}"; then
@@ -6861,14 +6904,14 @@ db_list_backups() {
         found=1
         i=$((i + 1))
         printf "\t%2d) %-45s %s\n" "${i}" "$(basename "${f}")" "$(du -h "${f}" | cut -f1)"
-    done < <(ls -t "${DB_BACKUP_DIR}"/x-ui_* 2> /dev/null)
+    done < <(ls -t "${DB_BACKUP_DIR}"/x-ui_*.db "${DB_BACKUP_DIR}"/x-ui_*.dump 2> /dev/null)
     [[ ${found} -eq 0 ]] && echo -e "${yellow}暂无备份文件。${plain}"
     return 0
 }
 
 # 从备份恢复：先停面板、快照当前库，再还原并重启
 db_restore_backup() {
-    local db files=() f i=0 choice pre ok
+    local db files=() f i=0 choice pre ok rnote rrc
     db="$(get_db_path)"
     if is_postgres_mode; then
         LOGE "PostgreSQL 模式请使用面板内备份恢复，或主菜单 24。"
@@ -6876,7 +6919,7 @@ db_restore_backup() {
     fi
     while IFS= read -r f; do
         files+=("${f}")
-    done < <(ls -t "${DB_BACKUP_DIR}"/x-ui_* 2> /dev/null)
+    done < <(ls -t "${DB_BACKUP_DIR}"/x-ui_*.db "${DB_BACKUP_DIR}"/x-ui_*.dump 2> /dev/null)
     if [[ ${#files[@]} -eq 0 ]]; then
         LOGE "没有可用备份（${DB_BACKUP_DIR}）。"
         return 1
@@ -6907,8 +6950,8 @@ db_restore_backup() {
 
     # 先快照当前库，恢复失败可回退
     pre="${DB_BACKUP_DIR}/pre_restore_$(date +%Y%m%d_%H%M%S).db"
-    if command -v sqlite3 > /dev/null 2>&1 && [[ "$(sqlite3 "${db}" 'PRAGMA quick_check;' 2> /dev/null)" == "ok" ]]; then
-        sqlite3 "${db}" ".backup '${pre}'" 2> /dev/null
+    if command -v sqlite3 > /dev/null 2>&1 && xui_db_check "${db}" > /dev/null 2>&1; then
+        sqlite3 "${db}" ".backup '${pre}'" 2> /dev/null || cp -f "${db}" "${pre}" 2> /dev/null
     elif [[ -f "${db}" ]]; then
         cp -f "${db}" "${pre}" 2> /dev/null
     fi
@@ -6923,14 +6966,26 @@ db_restore_backup() {
             ;;
         *)
             if command -v sqlite3 > /dev/null 2>&1; then
-                if [[ "$(sqlite3 "${f}" 'PRAGMA quick_check;' 2> /dev/null)" != "ok" ]]; then
-                    LOGE "备份文件完整性校验失败，中止恢复。"
+                rnote="$(xui_db_check "${f}")"
+                rrc=$?
+                if [[ ${rrc} -ne 0 ]]; then
+                    LOGE "备份文件完整性校验失败，中止恢复：${rnote}"
                     start 0
                     return 1
                 fi
+                [[ -n "${rnote}" ]] && LOGW "${rnote}"
             fi
-            if cp -f "${f}" "${db}"; then
-                ok=0
+            # 先拷到临时文件再原子替换，避免恢复一半留残库
+            if cp -f "${f}" "${db}.restore_tmp"; then
+                rm -f "${db}" "${db}-wal" "${db}-shm"
+                if mv -f "${db}.restore_tmp" "${db}"; then
+                    # 备份带 -wal 时一并带上，防止丢最近写入
+                    if [[ -f "${f}-wal" ]]; then
+                        cp -f "${f}-wal" "${db}-wal" 2> /dev/null
+                    fi
+                    rm -f "${db}-shm"
+                    ok=0
+                fi
             fi
             ;;
     esac
@@ -7049,8 +7104,14 @@ traffic_stats() {
         return 1
     fi
 
-    tsv="$(xui_sql_tsv "${db}" "SELECT port, protocol, remark, enable, up, down, total FROM inbounds ORDER BY (up + down) DESC;" 2> /dev/null)" || tsv=""
+    tsv="$(xui_sql_tsv "${db}" "SELECT port, protocol, remark, enable, up, down, total FROM inbounds ORDER BY (up + down) DESC;")"
     tsv="${tsv//$'\r'/}"
+    if [[ "${tsv}" == "Error:"* ]]; then
+        LOGE "查询失败：${tsv%%$'\n'*}"
+        [[ "${tsv}" == *"malformed database schema"* ]] && LOGI "本机 sqlite 过旧，读不了面板新版数据库（需 sqlite>=3.9）。可升级 sqlite3，或在面板 Web 界面查看流量。"
+        before_show_menu
+        return 1
+    fi
 
     echo -e "\n${green}===== 入站流量累计（按 上行+下行 排序）=====${plain}"
     if [[ -z "${tsv}" ]]; then
@@ -7086,8 +7147,12 @@ traffic_stats() {
         echo -e "  ── 共 ${n} 个入站：累计上行 $(fmt_bytes "${t_up}") / 下行 $(fmt_bytes "${t_down}") / 合计 $(fmt_bytes $((t_up + t_down)))"
     fi
 
-    tsv="$(xui_sql_tsv "${db}" "SELECT email, up, down, total FROM client_traffics ORDER BY (up + down) DESC LIMIT 10;" 2> /dev/null)" || tsv=""
+    tsv="$(xui_sql_tsv "${db}" "SELECT email, up, down, total FROM client_traffics ORDER BY (up + down) DESC LIMIT 10;")"
     tsv="${tsv//$'\r'/}"
+    if [[ "${tsv}" == "Error:"* ]]; then
+        LOGW "客户端流量查询失败：${tsv%%$'\n'*}"
+        tsv=""
+    fi
     echo -e "\n${green}===== 客户端流量 Top10 =====${plain}"
     if [[ -z "${tsv}" ]]; then
         echo -e "${yellow}（无客户端记录，或此版本面板没有 client_traffics 表）${plain}"
